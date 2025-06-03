@@ -1,0 +1,28 @@
+# Loads default set of integrations. Do not remove.
+default_config:
+
+# Load frontend themes from the themes folder
+frontend:
+  themes: !include_dir_merge_named themes
+
+# Automation, scripts, and scenes
+automation: !include automations.yaml
+script: !include scripts.yaml
+scene: !include scenes.yaml
+
+# Add the auth_provider section with auto-block settings
+auth_providers:
+  - type: homeassistant
+    ip_ban_enabled: true
+    login_attempts_threshold: 5
+
+# ✅ Ensure template sensors are correctly loaded
+template: !include templates.yaml
+
+input_number:
+  esp32_slider:
+    name: ESP32 Slider
+    min: 0
+    max: 60
+    step: 1
+    mode: slider

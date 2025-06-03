@@ -1,0 +1,50 @@
+- id: '1743073181133'
+  alias: Send slider value to ESP32
+  description: ''
+  triggers:
+  - topic: sleepRequest
+    trigger: mqtt
+  actions:
+  - data:
+      topic: sleepyTime
+      payload: '{{ states(''input_number.esp32_slider'') | int }},{{ states.input_number.esp32_slider.last_changed.timestamp()
+        }}
+
+        '
+      qos: '2'
+      retain: false
+    action: mqtt.publish
+
+- id: '1743759029522'
+  alias: Oppdater slider fra liveSleepyTime
+  description: Extract sleepyTime from string and update slider
+  triggers:
+  - topic: liveSleepyTime/fromRSi
+    trigger: mqtt
+  conditions: []
+  actions:
+  - target:
+      entity_id: input_number.esp32_slider
+    data:
+      value: '{{ trigger.payload | float }}'
+    action: input_number.set_value
+  mode: single
+
+- id: '1744278582482'
+  alias: Publish slider-verdi til liveSleepyTime
+  description: ''
+  triggers:
+  - entity_id:
+    - input_number.esp32_slider
+    trigger: state
+  - topic: liveSleepTimeRequest
+    trigger: mqtt
+  conditions: []
+  actions:
+  - data:
+      topic: liveSleepyTime/fromHome
+      payload: '{{ states(''input_number.esp32_slider'') | int }}'
+      qos: 2
+      retain: false
+    action: mqtt.publish
+  mode: single

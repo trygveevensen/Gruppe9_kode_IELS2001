@@ -1,0 +1,437 @@
+//includes
+#include <PubSubClient.h>
+#include <WiFi.h>
+#include "esp_sleep.h"
+#include <Wire.h>                                   //bibloteker for BME28
+#include <Adafruit_BME280.h>
+
+//defines
+#define BAUD_RATE 9600
+#define NUMBER_OF_DATA_TYPES 3  
+#define MILLISECONDS_FROM_MINUTES 60*1000
+#define MIN_TO_uS_FACTOR 60ULL * 1000000ULL
+#define SEC_TO_uS_FACTOR 1000000ULL
+#define USE_TESTDATA false                          //for testing
+#define NAME_OF_ESP "NameOfESP"
+
+//Wifi
+#define WIFI_SSID "WiFiName"                        //wifi navn
+#define WIFI_PASSWORD "WiFiPassword"                //wifi passord
+WiFiClient espClientHome;
+WiFiClient espClientRSBI;
+
+//
+#define MQTT_SLEEPTIME_TOPIC "sleepyTime"
+#define MQTT_SLEEPTIMEREQUEST_TOPIC "sleepRequest"
+
+//MQTT HomeAssist
+#define HOME_SERVER "gruppe9.duckdns.org"           // Endre til IP-en til MQTT-serveren (f.eks. Home Assistant)
+//#define HOME_SERVER "192.168.0.160"           // Endre til IP-en til MQTT-serveren (f.eks. Home Assistant)
+#define HOME_PORT 1883                              // Standard MQTT-port, kan endres hvis nødvendig
+#define HOME_USER "gruppe9"                         // MQTT-brukernavn
+#define HOME_PASSWORD "cZgCp7cR-cZgCp7cR-cZgCp7cR"  // MQTT-passord
+PubSubClient clientHome(espClientHome);
+
+//MQTT RSBI
+#define RSBI_SERVER "110405eh.duckdns.org"          // Endre til IP-en til MQTT-serveren (f.eks. Home Assistant)
+#define RSBI_PORT 1883                              // Standard MQTT-port, kan endres hvis nødvendig
+#define RSBI_USER "testEH"                          // MQTT-brukernavn
+#define RSBI_PASSWORD "123321"                      // MQTT-passord
+PubSubClient clientRSBI(espClientRSBI);
+
+//Sensor BME280 Adafruit
+#define BME_SCK 18 
+#define BME_MISO 19 
+#define BME_MOSI 23 
+#define BME_CS 5 
+Adafruit_BME280 bme(BME_CS, BME_MOSI, BME_MISO, BME_SCK); // software SPI
+
+//globale variabler
+float data[NUMBER_OF_DATA_TYPES] = {0};
+unsigned long goToBed = 1000 * 60 * 10;
+unsigned long delayTime; // BME280
+
+RTC_DATA_ATTR static bool discoverySent = true; // Send Home Assistant
+
+//old sleeptime is global var
+RTC_DATA_ATTR static uint32_t old_timeStamp = 0;    // MQTT_sleeptime
+RTC_DATA_ATTR static uint8_t old_sleepTime = 0;
+
+//erklere funksjoner
+bool timer(int intervall, unsigned long &prevTime);
+void deepSleepTime(uint8_t time_sleep_min);
+void collectFirstData();
+void makeTestData(); //for testing
+void sendHome();
+void sendRSBI();
+void setup_wifi();
+void MQTTSleepTime();
+void BME280_setup();
+void callback(char* topic, byte* payload, unsigned int length);
+void reconnectHome();
+void reconnectRSPI();
+void publishTimestamp();
+
+// Enhetsinfo Home
+const char* device_id = "bme280_ute";
+const char* device_name = NAME_OF_ESP;
+
+// Sensor-relaterte konstanter
+const char* sensor_keys[] = {"temperature", "humidity", "pressure"};
+const char* units[] = {"°C", "%", "hPa"};
+const char* device_classes[] = {"temperature", "humidity", "pressure"};
+const char* value_templates[] = {"{{ value }}", "{{ value }}", "{{ value }}"};
+
+const int NUM_SENSORS = 3;
+
+void setup() {
+  //seriel setup for testing
+  delay(500);
+  Serial.begin(BAUD_RATE);
+  delay(1000);
+  Serial.println("-------");
+  Serial.println("Starter");
+  Serial.println("-------");
+
+  //wifi setup
+  setup_wifi();
+
+  //home assistan client setup
+  clientHome.setServer(HOME_SERVER, HOME_PORT);
+  clientHome.setCallback(callback);
+
+  //rasberry pi client setup
+  clientRSBI.setServer(RSBI_SERVER, RSBI_PORT);
+  clientRSBI.setCallback(callback);
+
+  BME280_setup();
+}
+
+void loop() {
+  static bool firstDataCollected = false;
+  static bool delayedDataCollected = false;
+  static bool dataSent = false;
+  
+  if (USE_TESTDATA){//om macro for bruk av testdata er på, lager data med randint istedet for sensorer
+    makeTestData();
+    firstDataCollected = true;
+    delayedDataCollected = true;
+  }
+
+  if (!firstDataCollected){//hvis data ikke samla, samle data
+    collectFirstData();
+    firstDataCollected = true;
+    delayedDataCollected = true;
+  }
+  
+  if (firstDataCollected && delayedDataCollected && !dataSent && clientHome.connected() && clientRSBI.connected()){//hvis ALL data samlet og data ikke alerede sent, send data til server
+    sendHome();
+    sendRSBI();
+    dataSent = true;
+    Serial.println("Pubba data");
+  }
+
+  //client.loop()
+
+  if (!clientHome.connected()) {
+    reconnectHome();
+  }
+  clientHome.loop();  // Håndterer MQTT-meldinger
+  
+
+  if (!clientRSBI.connected()) {
+    reconnectRSBI();
+  }
+  clientRSBI.loop();  // Håndterer MQTT-meldinger
+
+  if (goToBed+15000 < millis()){ //om et sekund siden mqtt sleeptimer eller 10 min gått
+    deepSleepTime(old_sleepTime);
+  }
+}
+
+// Send måledata
+void sendHome() {
+  for (int i = 0; i < NUM_SENSORS; i++) {
+    String topic = "home/" + String(NAME_OF_ESP) + "/" + String(sensor_keys[i]);   // sensor_keys beskrivelser av datatype 
+    String payload = String(data[i]);
+    clientHome.publish(topic.c_str(), payload.c_str(), true);
+    Serial.println("Sendt til: " + topic + " --> " + payload);
+    Serial.println(data[i]);
+  }
+  clientHome.publish(MQTT_SLEEPTIMEREQUEST_TOPIC,"send");
+}
+
+void sendDiscoveryConfig() {
+  const char* sensor_keys[4] = {"temperature", "humidity", "pressure", "currentSleepTime"};
+  const char* units[4] = {"°C", "%", "hPa", "min"};
+  const char* device_classes[4] = {"temperature", "humidity", "pressure", "duration"};
+
+  for (int i = 0; i < 4; i++) {
+    String unique_id = String(NAME_OF_ESP) + "_" + sensor_keys[i];
+    String discovery_topic = "homeassistant/sensor/" + unique_id +"/config";
+    String state_topic = "home/" + String(NAME_OF_ESP) + "/" + sensor_keys[i];
+
+    String payload = "{";
+    payload += "\"name\": \"" + String(NAME_OF_ESP) + " " + sensor_keys[i] + "\",";
+    payload += "\"state_topic\": \"" + state_topic + "\",";
+    payload += "\"unit_of_measurement\": \"" + String(units[i]) + "\",";
+    payload += "\"device_class\": \"" + String(device_classes[i]) + "\",";
+    payload += "\"unique_id\": \"" + unique_id + "\",";
+    payload += "\"device\": {";
+    payload += "\"identifiers\": [\"" + String(NAME_OF_ESP) + "\"],";
+    payload += "\"name\": \"" + String(NAME_OF_ESP) + "\",";
+    payload += "\"manufacturer\": \"Espressif\",";
+    payload += "\"model\": \"ESP32\"";
+    payload += "}";
+    payload += "}";
+
+    // Publish discovery payload med retain = true
+    if (clientHome.publish(discovery_topic.c_str(), payload.c_str(), true)) {
+      Serial.println(payload);
+      Serial.print("Successfully published to ");
+      Serial.println(discovery_topic);
+    } else {
+      Serial.println("Publish FAILED");
+    }
+
+    delay(100); // liten delay for å unngå flooding
+  }
+}
+
+
+
+bool timer(int intervall, unsigned long &prevTime) { //Tar inn intervall i ms og unik prevTime variabel for hver gang den brukes i koden
+  if (millis() - prevTime >= intervall) {
+    prevTime = millis();  //returnerer true med valgt intervall
+    return true;
+  }
+  return false;
+}
+
+//tar inn en verdi mellom 0-70 og sover i så mange minutter, 0 fører til 10 sekunder søvn (for testing)
+void deepSleepTime(uint8_t time_sleep_min) {
+  if (!time_sleep_min){//hvis time_sleep_min = 0, sob i 10 sekunder
+    Serial.println("Går inn i deep sleep i 10 sekunder...");
+
+    esp_sleep_enable_timer_wakeup(10 * SEC_TO_uS_FACTOR);
+    delay(100); // Gi ESP tid til å sette opp deep sleep
+    esp_deep_sleep_start(); // Deep sleep
+  }
+  else {
+    Serial.println("Går inn i deep sleep i " + String(time_sleep_min) + " minutter...");
+
+    esp_sleep_enable_timer_wakeup((uint64_t)time_sleep_min * MIN_TO_uS_FACTOR);
+    delay(100); // Gi ESP tid til å sette opp deep sleep
+    esp_deep_sleep_start(); // Deep sleep
+  } 
+}
+/*
+void collectFirstData() { 
+  // Henter verdier fra BME-sensoren og lagrer dem i et globalt array kalt data
+  data[0] = bme.readTemperature();
+  data[1] = bme.readHumidity();
+  data[2] = bme.readPressure() / 100.0F; // Konverterer til hPa
+
+  // Skriver ut verdiene til seriell monitor
+  Serial.println(" ");
+  Serial.println("------------------------");
+  Serial.println("Temperature: " + String(data[0]) + " °C");
+  Serial.println("Humidity: " + String(data[1]) + " %");
+  Serial.println("Pressure: " + String(data[2]) + " hPa");
+  Serial.println("------------------------");
+  Serial.println(" ");
+}
+*/
+void collectFirstData() {
+  // Sett BME280 til forced mode for én måling
+  bme.setSampling(
+    Adafruit_BME280::MODE_FORCED,
+    Adafruit_BME280::SAMPLING_X1,
+    Adafruit_BME280::SAMPLING_X1,
+    Adafruit_BME280::SAMPLING_X1,
+    Adafruit_BME280::FILTER_OFF
+  );
+
+  // Utfør måling
+  if (bme.takeForcedMeasurement()) {
+    data[0] = bme.readTemperature();
+    data[1] = bme.readHumidity();
+    data[2] = bme.readPressure() / 100.0F; // hPa
+
+    Serial.println(" ");
+    Serial.println("------------------------");
+    Serial.println("Temperature: " + String(data[0]) + " °C");
+    Serial.println("Humidity: " + String(data[1]) + " %");
+    Serial.println("Pressure: " + String(data[2]) + " hPa");
+    Serial.println("------------------------");
+    Serial.println(" ");
+  } else {
+    Serial.println("BME280-måling feilet.");
+  }
+
+  // Sett sensor i sleep mode etter måling
+  bme.setSampling(
+    Adafruit_BME280::MODE_SLEEP,
+    Adafruit_BME280::SAMPLING_NONE,
+    Adafruit_BME280::SAMPLING_NONE,
+    Adafruit_BME280::SAMPLING_NONE,
+    Adafruit_BME280::FILTER_OFF
+  );
+}
+/*
+void makeTestData(){
+  for (int i=0;i<NUMBER_OF_DATA_TYPES;i++){
+    data[i] = random(i+1,(i+1)*10);
+  }
+}
+*/
+void sendRSBI(){//send data til rasberri pi (nettside server)
+  
+  String payload = NAME_OF_ESP;
+  for (int i=0;i<NUMBER_OF_DATA_TYPES;i++){
+    payload = payload + "," + String(data[i]);
+  }
+  clientRSBI.publish("data",payload.c_str());
+  clientRSBI.publish(MQTT_SLEEPTIMEREQUEST_TOPIC,"awake");
+  Serial.println(payload);
+}
+
+void setup_wifi() {
+  Serial.print("Kobler til WiFi...");
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  unsigned long startAttemptTime = millis();
+  while (WiFi.status() != WL_CONNECTED) {
+    if (millis() - startAttemptTime > 5000) {
+      Serial.println("\nKunne ikke koble til WiFi etter 5 sekunder. Starter på nytt...");
+      delay(1000);
+      ESP.restart();
+    }
+    delay(500);
+    Serial.print(".");
+  }
+
+  Serial.println(" Tilkoblet til WiFi!");
+}
+
+void reconnectHome() {
+  while (!clientHome.connected()) {
+    Serial.print("Kobler til MQTTHome...");
+    String clientId = "ESP32Client-" + String(random(0xffff), HEX);
+    if (clientHome.connect(clientId.c_str(), HOME_USER, HOME_PASSWORD)) {
+      Serial.println("Tilkoblet til MQTTHome!");
+      clientHome.subscribe(MQTT_SLEEPTIME_TOPIC);
+      delay(100);
+      if (discoverySent == true){
+        sendDiscoveryConfig();    // Konfiguerer enheter på home assistant kun en gang
+        discoverySent = false;
+      }
+    } else {
+      Serial.print("Feilet, rc=");
+      Serial.print(clientHome.state());
+      Serial.println(" Prøver igjen om 1 sek...");
+      delay(1000);
+    }
+  }
+}
+
+void reconnectRSBI() {
+  while (!clientRSBI.connected()) {
+    Serial.print("Kobler til MQTTRSBI...");
+    String clientId = "ESP32Client-" + String(random(0xffff), HEX);
+    if (clientRSBI.connect(clientId.c_str(), RSBI_USER, RSBI_PASSWORD)) {
+      Serial.println("Tilkoblet til MQTTRSBI!");
+      clientRSBI.subscribe(MQTT_SLEEPTIME_TOPIC);
+    } else {
+      Serial.print("Feilet, rc=");
+      Serial.print(clientRSBI.state());
+      Serial.println(" Prøver igjen om 1 sek...");
+      delay(1000);
+    }
+  }
+}
+
+void callback(char* topic, byte* payload, unsigned int length) {
+  int minutesToSleep = 0;
+  Serial.print("Mottatt melding på topic ");
+  Serial.print(topic);
+  Serial.print(": ");
+  
+  String message = "";
+  for (int i = 0; i < length; i++) {
+    message += (char)payload[i];
+  }
+  Serial.println(message);
+
+  if (strcmp(topic, MQTT_SLEEPTIME_TOPIC) == 0){
+    MQTTSleepTime(message);
+  }
+}
+
+void MQTTSleepTime(String message){
+
+  //deler csv formatet i variabler
+  String sleepTimeString = getValue(message,',',0);
+  String timeStampString = getValue(message,',',1);
+
+  uint8_t new_sleepTime = sleepTimeString.toInt();      // Konverterer mottatt sleeptime melding til int
+  uint32_t new_Timestamp = timeStampString.toInt();      // Konverterer mottatt timestamp melding til int
+
+  if (new_Timestamp > old_timeStamp){                // Om timestamp er nyere enn forrige, oppdater intervall
+  old_timeStamp = new_Timestamp;
+  old_sleepTime = new_sleepTime;
+  String topic = "home/" + String(NAME_OF_ESP) + "/currentSleepTime";   // Sender sovetid til Home Assistant når den endres
+  String payload = String(new_sleepTime);
+  clientHome.publish(topic.c_str(), payload.c_str(), true);
+  }
+  
+  static bool n = true;
+
+  goToBed = millis();
+}
+
+
+// Funksjon for å separere sleepTime og tidssempel: 
+// Hentet fra: (https://stackoverflow.com/questions/9072320/split-string-into-string-array)
+String getValue(String data, char separator, int index)
+{
+  int found = 0;
+  int strIndex[] = {0, -1};
+  int maxIndex = data.length()-1;
+
+  for(int i=0; i<=maxIndex && found<=index; i++){
+    if(data.charAt(i)==separator || i==maxIndex){
+        found++;
+        strIndex[0] = strIndex[1]+1;
+        strIndex[1] = (i == maxIndex) ? i+1 : i;
+    }
+  }
+
+  return found>index ? data.substring(strIndex[0], strIndex[1]) : "";
+}
+
+// Funksjon for å lese av sensoren: (modifisert vedlagt kodeeksempel)
+void BME280_setup() {
+  //Serial.begin(115200);
+  delay(1000);
+  Serial.println(F("BME280 test"));
+
+  unsigned status;
+  
+  status = bme.begin();  
+
+  if (!status) {
+      Serial.println("Could not find a valid BME280 sensor, check wiring, address, sensor ID!");
+      Serial.print("SensorID was: 0x"); Serial.println(bme.sensorID(),16);
+      Serial.print("        ID of 0xFF probably means a bad address, a BMP 180 or BMP 085\n");
+      Serial.print("   ID of 0x56-0x58 represents a BMP 280,\n");
+      Serial.print("        ID of 0x60 represents a BME 280.\n");
+      Serial.print("        ID of 0x61 represents a BME 680.\n");
+      delay(10);
+  }
+  
+  Serial.println("-- Default Test --");
+  delayTime = 1000;
+
+  Serial.println();
+}

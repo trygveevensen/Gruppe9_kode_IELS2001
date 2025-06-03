@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<!-- <meta http-equiv="refresh" content="5"> -->
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SensorData</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+    <div id="hoved">
+
+       <div class="toppbarcontainer">
+          <a href="index.html"> <div class="toppbaritem"><br><h1>Kontrolpanel</h1></div> </a>
+          <a href="t.html"> <div class="toppbaritem"><br><h1>Totalt</h1></div> </a>  
+          <a href="d.html"> <div class="toppbaritem"><br><h1>Dag</h1></div> </a>
+          <a href="w.html"> <div class="toppbaritem"><br><h1>Uke</h1></div> </a> 
+          <a href="m.html"> <div class="toppbaritem"><br><h1>Måned</h1></div> </a>
+          <a href="y.html"> <div class="toppbaritem"><br><h1>År</h1></div> </a>     
+        </div>
+      
+      
+        <div class="maintext">
+            <a href="data.txt" download>Last ned Data</a>
+            <br>
+            <input type="text" id="userInput" placeholder="Sett sovetid (minutter)">
+            <button onclick="saveData()">Lagre</button>
+            <br>
+            Nåverende Sleeptime: "sleeptime,timestamp"
+            <iframe src="sleeptime.txt" width="15%" height="10%" style="border:1px solid #ccc;"></iframe>
+
+    <script>
+      // ALL Javasctipt kode skrevet av ChatGPT
+        function saveData() {
+          const inputText = document.getElementById("userInput").value;
+          fetch("save.php", {
+          method: "POST",
+          headers: { "Content-Type": "application/x-www-form-urlencoded" },
+          body: "data=" + encodeURIComponent(inputText)
+          })
+          .then(r => r.text())
+          .then(alert)
+          .catch(console.error);
+       }
+    </script>
+        </div>
+    </div>
+</body>
+</html>
